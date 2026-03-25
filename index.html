@@ -286,9 +286,8 @@ body{font-family:'Lato',sans-serif;color:var(--tx)}
         </div>
         <div style="display:flex;gap:8px;margin-bottom:10px;align-items:stretch">
           <button class="btn btn-p" style="flex:1;font-size:15px;padding:13px" onclick="openOrderForm(null,orDate)">+ Nuovo Ordine</button>
-          <label for="ocr-file-input" id="btn-ocr-foto" title="Scansiona foglio ordini" style="width:52px;height:52px;padding:0;font-size:22px;flex-shrink:0;border-radius:var(--rs);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;background:var(--cd);color:var(--br);box-sizing:border-box;user-select:none">📷</label>
+          <label id="btn-ocr-foto" style="width:52px;height:52px;font-size:22px;flex-shrink:0;border-radius:var(--rs);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;background:var(--cd);color:var(--br);-webkit-tap-highlight-color:transparent;overflow:hidden;position:relative"><input type="file" id="ocr-file-input" accept="image/*" capture="environment" style="position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%;font-size:0" onchange="handleOcrImage(this)">&#x1F4F7;</label>
         </div>
-        <input type="file" id="ocr-file-input" accept="image/*" capture="environment" style="display:none;position:absolute;left:-9999px" onchange="handleOcrImage(this)">
         <div class="filter-bar" id="or-filters"></div>
         <div style="display:flex;gap:8px;margin-bottom:8px">
           <button class="btn btn-s btn-sm" id="or-print" style="display:none;flex:1" onclick="doPrint()">🖨️ Stampa lista</button>
@@ -2462,53 +2461,63 @@ function openTableBuilder(){
 }
 
 
-/* ════ OCR FOTOCAMERA ════ */
+/* OCR FOTOCAMERA */
 function getOcrApiKey(){return localStorage.getItem('pf_apikey')||'';}
+
+function _ocrMsg(msg){
+  console.log('[OCR] '+msg);
+  var t=document.getElementById('toast');
+  if(t){t.textContent=msg;t.classList.add('show');clearTimeout(window._omt);window._omt=setTimeout(function(){t.classList.remove('show');},5000);}
+}
+
+function _ocrBusy(on){
+  var lbl=document.getElementById('btn-ocr-foto');
+  var inp=document.getElementById('ocr-file-input');
+  if(lbl){lbl.style.opacity=on?'0.5':'1';lbl.style.pointerEvents=on?'none':'';}
+  if(inp)inp.disabled=!!on;
+}
 
 function openApiKeyModal(cb){
   var cur=getOcrApiKey();
-  var html='<div class="sheet-hd"></div>'+
-    '<div class="sheet-ti">\uD83D\uDD11 API Key Anthropic</div>'+
-    '<p style="font-size:13px;color:var(--txl);margin-bottom:14px">Necessaria solo la prima volta. Salvata sul dispositivo.<br>Ottienila su <b>console.anthropic.com</b> \u2192 API Keys.</p>'+
-    '<div class="fg"><label class="lbl">Chiave API (sk-ant-\u2026)</label>'+
-    '<input class="inp" id="apikey-inp" type="password" placeholder="sk-ant-api03-\u2026" value="'+cur+'" style="font-size:13px"></div>'+
-    '<div style="display:flex;gap:8px;margin-top:4px">'+
-    '<button class="btn btn-s btn-full" onclick="closeModal()">Annulla</button>'+
-    '<button class="btn btn-p btn-full" onclick="_saveOcrKey()">Salva e continua</button>'+
-    '</div>';
+  var html='<div class="sheet-hd"></div>'
+    +'<div class="sheet-ti">&#x1F511; API Key Anthropic</div>'
+    +'<p style="font-size:13px;color:var(--txl);margin-bottom:14px">Necessaria solo la prima volta. '
+    +'Salvata sul dispositivo.<br>Ottienila su <b>console.anthropic.com</b> &rarr; API Keys.</p>'
+    +'<div class="fg"><label class="lbl">Chiave API (sk-ant-&hellip;)</label>'
+    +'<input class="inp" id="apikey-inp" type="password" placeholder="sk-ant-api03-..." '
+    +'value="'+cur+'" style="font-size:13px"></div>'
+    +'<div style="display:flex;gap:8px;margin-top:4px">'
+    +'<button class="btn btn-s btn-full" onclick="closeModal()">Annulla</button>'
+    +'<button class="btn btn-p btn-full" onclick="_saveOcrKey()">Salva e continua</button>'
+    +'</div>';
   window._ocrCb=cb;
   showModal(html);
 }
 
 function _saveOcrKey(){
   var v=(document.getElementById('apikey-inp').value||'').trim();
-  if(!v.startsWith('sk-')){showToast('\u274C Chiave non valida');return;}
+  if(!v.startsWith('sk-')){_ocrMsg('Chiave non valida');return;}
   localStorage.setItem('pf_apikey',v);
   closeModal();
   if(window._ocrCb){var fn=window._ocrCb;window._ocrCb=null;fn(v);}
 }
 
-function _ocrSetLoading(on){
-  var lbl=document.getElementById('btn-ocr-foto');
-  var inp=document.getElementById('ocr-file-input');
-  if(!lbl)return;
-  if(on){lbl.innerHTML='\u23F3';lbl.style.pointerEvents='none';lbl.style.opacity='0.55';if(inp)inp.disabled=true;}
-  else{lbl.innerHTML='\uD83D\uDCF7';lbl.style.pointerEvents='';lbl.style.opacity='';if(inp){inp.disabled=false;try{inp.value='';}catch(e){}}}
-}
-
 function handleOcrImage(input){
-  if(!input||!input.files||!input.files[0])return;
+  if(!input||!input.files||!input.files[0]){_ocrMsg('Nessun file selezionato');return;}
   var file=input.files[0];
+  _ocrMsg('Foto ricevuta, elaboro...');
   var reader=new FileReader();
+  reader.onerror=function(){_ocrMsg('Errore lettura immagine');};
   reader.onload=function(e){
     var b64=e.target.result.split(',')[1];
     var mime=file.type||'image/jpeg';
-    _ocrSetLoading(true);
+    _ocrBusy(true);
     var key=getOcrApiKey();
     if(!key){
-      _ocrSetLoading(false);
-      openApiKeyModal(function(){_ocrSetLoading(true);_callOcr(b64,mime);});
+      _ocrBusy(false);
+      openApiKeyModal(function(){_ocrBusy(true);_callOcr(b64,mime);});
     } else {
+      _ocrMsg('Chiamo Claude...');
       _callOcr(b64,mime);
     }
   };
@@ -2518,16 +2527,17 @@ function handleOcrImage(input){
 async function _callOcr(b64,mime){
   var key=getOcrApiKey();
   var pl=products.map(function(p){return p.name+' ('+p.unit+')';}).join(', ');
-  var pv=PUNTI.join(', ');
-  var sys='Sei un assistente OCR per fogli ordini di pasta artigianale scritti a mano.\n'+
-    'Per ogni ordine nel foglio estrai: nome cliente, telefono (se leggibile), punto vendita (uno tra: '+pv+'), prodotti con quantità e unità, orario ritiro o consegna, se è consegna a domicilio, note.\n'+
-    'Prodotti disponibili: '+pl+'.\n'+
-    'Quantità in kg: 3 decimali (es. 0.500). Quantità in pz: intero.\n'+
-    'Rispondi SOLO con JSON valido senza markdown nel formato:\n'+
-    '{"ordini":[{"customerName":"","customerPhone":"","pv":"","items":[{"productName":"","qty":"","unit":""}],"consegna":false,"indirizzoConsegna":"","orarioRitiro":"","orarioConsegna":"","notes":""}]}\n'+
-    'Punto vendita default se non leggibile: '+PUNTI[0]+'.';
+  var pvl=PUNTI.join(', ');
+  var sys='Sei un assistente OCR per fogli ordini di pasta artigianale scritti a mano.'
+    +' Per ogni ordine estrai: nome cliente, telefono, punto vendita (uno tra: '+pvl+'),'
+    +' prodotti con quantita e unita, orario ritiro o consegna, se consegna a domicilio, note.'
+    +' Prodotti: '+pl+'.'
+    +' Quantita kg: 3 decimali es 0.500. Pezzi: intero.'
+    +' Rispondi SOLO JSON senza markdown:'
+    +' {"ordini":[{"customerName":"","customerPhone":"","pv":"","items":[{"productName":"","qty":"","unit":""}],"consegna":false,"indirizzoConsegna":"","orarioRitiro":"","orarioConsegna":"","notes":""}]}'
+    +' PV default: '+PUNTI[0]+'.';
   try{
-    var r=await fetch('https://api.anthropic.com/v1/messages',{
+    var resp=await fetch('https://api.anthropic.com/v1/messages',{
       method:'POST',
       headers:{
         'content-type':'application/json',
@@ -2545,36 +2555,35 @@ async function _callOcr(b64,mime){
         ]}]
       })
     });
-    var d=await r.json();
-    _ocrSetLoading(false);
+    _ocrMsg('Risposta HTTP '+resp.status);
+    var d=await resp.json();
+    _ocrBusy(false);
     if(d.error){
+      _ocrMsg('Errore API: '+d.error.type+' - '+d.error.message);
       if(d.error.type==='authentication_error'){
         localStorage.removeItem('pf_apikey');
-        showToast('\u274C API Key non valida, reinseriscila');
-        openApiKeyModal(function(){_ocrSetLoading(true);_callOcr(b64,mime);});
-      } else {
-        showToast('\u274C '+d.error.message);
+        openApiKeyModal(function(){_ocrBusy(true);_callOcr(b64,mime);});
       }
       return;
     }
     var tb=d.content&&d.content.find(function(x){return x.type==='text';});
-    if(!tb){showToast('\u274C Nessuna risposta');return;}
+    if(!tb){_ocrMsg('Nessuna risposta testuale');return;}
+    var raw=tb.text.trim().replace(/```json|```/g,'').trim();
     var parsed;
-    try{parsed=JSON.parse(tb.text.trim().replace(/```json|```/g,'').trim());}
-    catch(e){showToast('\u274C Impossibile leggere la risposta');console.error(e,tb.text);return;}
-    if(!parsed.ordini||!parsed.ordini.length){showToast('\u26A0\uFE0F Nessun ordine trovato');return;}
+    try{parsed=JSON.parse(raw);}
+    catch(e){_ocrMsg('Parse JSON fallito: '+raw.substring(0,60));return;}
+    if(!parsed.ordini||!parsed.ordini.length){_ocrMsg('Nessun ordine trovato nel foglio');return;}
     _importOcrOrders(parsed.ordini);
   }catch(e){
-    _ocrSetLoading(false);
-    showToast('\u274C Errore: '+e.message);
-    console.error(e);
+    _ocrBusy(false);
+    _ocrMsg('Errore rete: '+e.message);
   }
 }
 
 function _importOcrOrders(raw){
   var added=0,skipped=0;
   raw.forEach(function(ro){
-    var isDupe=orders.some(function(o){
+    var dup=orders.some(function(o){
       if(o.date!==orDate)return false;
       var na=(o.customerName||'').toLowerCase().trim();
       var nb=(ro.customerName||'').toLowerCase().trim();
@@ -2583,10 +2592,9 @@ function _importOcrOrders(raw){
       var bp=(ro.items||[]).map(function(i){return(i.productName||'').toLowerCase().trim();}).sort().join('|');
       return ap===bp;
     });
-    if(isDupe){skipped++;return;}
-    var cust=null;
+    if(dup){skipped++;return;}
     var nm=(ro.customerName||'').toLowerCase().trim();
-    if(nm)cust=customers.find(function(c){return(c.name||'').toLowerCase().trim()===nm;});
+    var cust=nm?customers.find(function(c){return(c.name||'').toLowerCase().trim()===nm;}):null;
     if(!cust){
       cust={id:uid(),name:ro.customerName||'Cliente OCR',phone:(ro.customerPhone||'').replace(/\D/g,'')};
       customers.push(cust);
@@ -2594,34 +2602,30 @@ function _importOcrOrders(raw){
     var items=(ro.items||[]).map(function(ri){
       var rn=(ri.productName||'').toLowerCase();
       var w=rn.split(' ')[0];
-      var prod=products.find(function(p){return(p.name||'').toLowerCase().includes(w);});
-      if(!prod&&rn.length>3)prod=products.find(function(p){return(p.name||'').toLowerCase().includes(rn.slice(0,4));});
-      if(!prod)prod=products[0];
-      if(!prod)return null;
-      return{productId:prod.id,productName:prod.name,qty:ri.qty||'0',unit:ri.unit||prod.unit};
+      var p=products.find(function(x){return(x.name||'').toLowerCase().includes(w);});
+      if(!p&&rn.length>3)p=products.find(function(x){return(x.name||'').toLowerCase().includes(rn.slice(0,4));});
+      if(!p)p=products[0];
+      if(!p)return null;
+      return{productId:p.id,productName:p.name,qty:ri.qty||'0',unit:ri.unit||p.unit};
     }).filter(Boolean);
-    var pvval=ro.pv||PUNTI[0];
-    if(PUNTI.indexOf(pvval)<0){
-      var pl=pvval.toLowerCase();
-      pvval=PUNTI.find(function(p){return p.toLowerCase().includes(pl)||pl.includes(p.toLowerCase());})||PUNTI[0];
+    var pv=ro.pv||PUNTI[0];
+    if(PUNTI.indexOf(pv)<0){
+      var pl2=pv.toLowerCase();
+      pv=PUNTI.find(function(x){return x.toLowerCase().includes(pl2)||pl2.includes(x.toLowerCase());})||PUNTI[0];
     }
     orders.push({
-      id:uid(),date:orDate,
-      customerId:cust.id,customerName:cust.name,customerPhone:cust.phone,
-      pv:pvval,items:items,itemsDone:[],
+      id:uid(),date:orDate,customerId:cust.id,customerName:cust.name,
+      customerPhone:cust.phone,pv:pv,items:items,itemsDone:[],
       consegna:!!ro.consegna,indirizzoConsegna:ro.indirizzoConsegna||'',
       orarioRitiro:ro.orarioRitiro||'',orarioConsegna:ro.orarioConsegna||'',
-      notes:ro.notes||'',stato:'nuovo',importo:'',
-      createdAt:new Date().toISOString()
+      notes:ro.notes||'',stato:'nuovo',importo:'',createdAt:new Date().toISOString()
     });
     added++;
   });
-  lsSet('pf_orders',orders);
-  lsSet('pf_customers',customers);
-  renderOrdini();
-  if(added&&skipped)showToast('\u2705 '+added+' nuovi ordini aggiunti ('+skipped+' già presenti)');
-  else if(added)showToast('\u2705 '+added+' ordini importati!');
-  else showToast('\u2139\uFE0F Tutti gli ordini erano già presenti');
+  lsSet('pf_orders',orders);lsSet('pf_customers',customers);renderOrdini();
+  if(added&&skipped)_ocrMsg(added+' ordini aggiunti ('+skipped+' gia presenti)');
+  else if(added)_ocrMsg(added+' ordini importati!');
+  else _ocrMsg('Tutti gli ordini erano gia presenti');
 }
 
 /* DEMO DATA */
