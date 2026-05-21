@@ -12,7 +12,11 @@ exports.handler = async (event) => {
   }
 
   try {
-    const { phoneId, token, to, message } = JSON.parse(event.body);
+    const body = JSON.parse(event.body);
+    const { phoneId, token, to, message } = body;
+
+    // Log input ricevuto
+    console.log("INPUT:", JSON.stringify({ phoneId, to, message, tokenLen: token?.length }));
 
     const postData = JSON.stringify({
       messaging_product: "whatsapp",
@@ -44,6 +48,9 @@ exports.handler = async (event) => {
       req.end();
     });
 
+    // Log risposta Meta
+    console.log("META RESPONSE:", result.status, result.body);
+
     return {
       statusCode: result.status,
       headers: { ...headers, "Content-Type": "application/json" },
@@ -51,6 +58,7 @@ exports.handler = async (event) => {
     };
 
   } catch (e) {
+    console.log("ERRORE:", e.message);
     return {
       statusCode: 500,
       headers: { ...headers, "Content-Type": "application/json" },
