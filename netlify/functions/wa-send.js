@@ -12,18 +12,31 @@ exports.handler = async (event) => {
   }
 
   try {
-    const body = JSON.parse(event.body);
-    const { phoneId, token, to, message } = body;
+    const { phoneId, token, to, message, template } = JSON.parse(event.body);
 
-    // Log input ricevuto
-    console.log("INPUT:", JSON.stringify({ phoneId, to, message, tokenLen: token?.length }));
+    let payload;
+    if (template) {
+      // Invia template (es. hello_world per test)
+      payload = {
+        messaging_product: "whatsapp",
+        to: to,
+        type: "template",
+        template: {
+          name: template,
+          language: { code: "en_US" }
+        }
+      };
+    } else {
+      // Invia testo libero
+      payload = {
+        messaging_product: "whatsapp",
+        to: to,
+        type: "text",
+        text: { body: message }
+      };
+    }
 
-    const postData = JSON.stringify({
-      messaging_product: "whatsapp",
-      to: to,
-      type: "text",
-      text: { body: message }
-    });
+    const postData = JSON.stringify(payload);
 
     const result = await new Promise((resolve, reject) => {
       const options = {
@@ -48,9 +61,6 @@ exports.handler = async (event) => {
       req.end();
     });
 
-    // Log risposta Meta
-    console.log("META RESPONSE:", result.status, result.body);
-
     return {
       statusCode: result.status,
       headers: { ...headers, "Content-Type": "application/json" },
@@ -58,7 +68,6 @@ exports.handler = async (event) => {
     };
 
   } catch (e) {
-    console.log("ERRORE:", e.message);
     return {
       statusCode: 500,
       headers: { ...headers, "Content-Type": "application/json" },
