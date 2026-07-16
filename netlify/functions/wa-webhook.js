@@ -27,15 +27,6 @@ const PROJECT_ID = "il-pastaio-b8d61";
 const FIRESTORE_BASE = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
 const GRAPH_API_VERSION = "v19.0";
 
-// ── Punti vendita: stessa lista/alias di index.html (PUNTI / _PV_ALIAS / _normPV) ──
-const PUNTI = ["NUMANA", "OSIMO STAZIONE", "SIROLO", "ANCONA"];
-const PV_ALIAS = { OSIMO: "OSIMO STAZIONE", NUM: "NUMANA", OSI: "OSIMO STAZIONE", SIR: "SIROLO", ANC: "ANCONA" };
-function normPV(s) {
-  if (!s) return null;
-  const u = String(s).trim().replace(/\s+/g, " ").toUpperCase();
-  return PV_ALIAS[u] || u;
-}
-
 // ── Righe del menu a lista mandato ai contatti non ancora assegnati a un PV ──
 const PV_LIST_ROWS = [
   { id: "pv_numana", title: "Numana" },
@@ -221,14 +212,6 @@ async function findCustomerId(phone, waId, accessToken) {
   return id;
 }
 
-// ── Legge il pv (normalizzato) di un cliente già in anagrafica, se presente ──
-async function getCustomerPV(customerId, accessToken) {
-  if (!customerId) return null;
-  const doc = await getDocument("customers/" + encodeURIComponent(customerId), accessToken);
-  if (!doc || !doc.pv) return null;
-  return normPV(doc.pv);
-}
-
 // ── Legge token+phoneId dell'account WhatsApp da settings/wa_config ──
 async function getWaConfig(accessToken) {
   const doc = await getDocument("settings/wa_config", accessToken);
@@ -342,27 +325,12 @@ async function upsertConversation(info, msg, accessToken) {
       unreadCount: 0,
       pvPromptCount: 0
     };
-    // Se il numero è già un cliente noto con pv in anagrafica, assegna subito senza chiedere nulla
-    const custPv = await getCustomerPV(customerId, accessToken);
-    if (custPv) {
-      conv.pv = custPv;
-      conv.pvStatus = "assigned";
-    }
   }
 
   // Risposta al menu: assegna il pv scelto dal cliente
   if (conv.pvStatus === "pending" && listReplyId && PV_ID_TO_NAME[listReplyId]) {
     conv.pv = PV_ID_TO_NAME[listReplyId];
     conv.pvStatus = "assigned";
-  }
-
-  // Se nel frattempo il cliente è stato collegato/aggiornato in anagrafica con un pv, riallinea
-  if (conv.pvStatus === "pending" && customerId && !listReplyId) {
-    const custPv = await getCustomerPV(customerId, accessToken);
-    if (custPv) {
-      conv.pv = custPv;
-      conv.pvStatus = "assigned";
-    }
   }
 
   conv.customerId = customerId || conv.customerId || null;
