@@ -36,6 +36,14 @@ const PV_LIST_ROWS = [
 ];
 const PV_ID_TO_NAME = { pv_numana: "NUMANA", pv_osimo: "OSIMO STAZIONE", pv_sirolo: "SIROLO", pv_ancona: "ANCONA" };
 
+// ── Alias storici del campo pv, stessa logica di _normPV() in index.html ──
+const PV_ALIAS = { OSIMO: "OSIMO STAZIONE", NUM: "NUMANA", OSI: "OSIMO STAZIONE", SIR: "SIROLO", ANC: "ANCONA" };
+function normPV(s) {
+  if (!s) return null;
+  const u = String(s).trim().replace(/\s+/g, " ").toUpperCase();
+  return PV_ALIAS[u] || u;
+}
+
 // Numero massimo di volte che rimandiamo il menu se il cliente non risponde toccandolo
 const MAX_PV_PROMPTS = 2;
 
@@ -212,6 +220,44 @@ async function findCustomerId(phone, waId, accessToken) {
   return id;
 }
 
+// ── Cerca l'ordine più recente di un cliente e restituisce il suo pv (normalizzato), o null ──
+// NB: questa query richiede un indice composito Firestore (customerId + date).
+// La primissima volta, se l'indice non esiste ancora, Firestore risponde con un errore
+// che contiene un link diretto per crearlo: lo trovi nei log della function su Netlify.
+async function getLatestOrderPV(customerId, accessToken) {
+  if (!customerId) return null;
+  const url = FIRESTORE_BASE + ":runQuery";
+  const body = {
+    structuredQuery: {
+      from: [{ collectionId: "orders" }],
+      where: {
+        fieldFilter: {
+          field: { fieldPath: "customerId" },
+          op: "EQUAL",
+          value: { stringValue: customerId }
+        }
+      },
+      orderBy: [{ field: { fieldPath: "date" }, direction: "DESCENDING" }],
+      limit: 1
+    }
+  };
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error("Errore query ultimo ordine cliente (indice Firestore mancante?):", res.status, errText);
+    return null;
+  }
+  const data = await res.json();
+  const match = Array.isArray(data) ? data.find(function (r) { return r.document; }) : null;
+  if (!match) return null;
+  const fields = fromFirestoreFields(match.document.fields);
+  return fields.pv ? normPV(fields.pv) : null;
+}
+
 // ── Legge token+phoneId dell'account WhatsApp da settings/wa_config ──
 async function getWaConfig(accessToken) {
   const doc = await getDocument("settings/wa_config", accessToken);
@@ -325,12 +371,29 @@ async function upsertConversation(info, msg, accessToken) {
       unreadCount: 0,
       pvPromptCount: 0
     };
+    // Cliente già conosciuto: prova a dedurre il pv dal suo ordine più recente
+    if (customerId) {
+      const orderPv = await getLatestOrderPV(customerId, accessToken);
+      if (orderPv) {
+        conv.pv = orderPv;
+        conv.pvStatus = "assigned";
+      }
+    }
   }
 
   // Risposta al menu: assegna il pv scelto dal cliente
   if (conv.pvStatus === "pending" && listReplyId && PV_ID_TO_NAME[listReplyId]) {
     conv.pv = PV_ID_TO_NAME[listReplyId];
     conv.pvStatus = "assigned";
+  }
+
+  // Ancora in attesa ma con un cliente noto: ritenta la deduzione (potrebbe aver ordinato nel frattempo)
+  if (conv.pvStatus === "pending" && customerId && !listReplyId) {
+    const orderPv = await getLatestOrderPV(customerId, accessToken);
+    if (orderPv) {
+      conv.pv = orderPv;
+      conv.pvStatus = "assigned";
+    }
   }
 
   conv.customerId = customerId || conv.customerId || null;
