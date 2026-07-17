@@ -365,6 +365,7 @@ async function upsertConversation(info, msg, accessToken) {
       customerId: customerId || null,
       pv: null,
       pvStatus: "pending",
+      pvSource: null, // "order" = dedotto da un ordine, "menu" = scelto dal cliente
       lastMessageText: null,
       lastMessageAt: 0,
       lastInboundAt: 0,
@@ -377,14 +378,16 @@ async function upsertConversation(info, msg, accessToken) {
       if (orderPv) {
         conv.pv = orderPv;
         conv.pvStatus = "assigned";
+        conv.pvSource = "order";
       }
     }
   }
 
-  // Risposta al menu: assegna il pv scelto dal cliente
+  // Risposta al menu: assegna il pv scelto dal cliente (scelta esplicita, non verrà più ricontrollata)
   if (conv.pvStatus === "pending" && listReplyId && PV_ID_TO_NAME[listReplyId]) {
     conv.pv = PV_ID_TO_NAME[listReplyId];
     conv.pvStatus = "assigned";
+    conv.pvSource = "menu";
   }
 
   // Ancora in attesa ma con un cliente noto: ritenta la deduzione (potrebbe aver ordinato nel frattempo)
@@ -393,6 +396,19 @@ async function upsertConversation(info, msg, accessToken) {
     if (orderPv) {
       conv.pv = orderPv;
       conv.pvStatus = "assigned";
+      conv.pvSource = "order";
+    }
+  }
+
+  // Pv già assegnato ma dedotto da un ordine (non scelto esplicitamente dal cliente): ricontrolla
+  // ad ogni messaggio, perché il cliente potrebbe aver fatto nel frattempo un ordine per un altro pv.
+  // (conv.pvSource mancante = conversazione creata prima di questa modifica: trattata come "order"
+  // per sicurezza, così si autocorregge automaticamente al primo messaggio successivo)
+  if (conv.pvStatus === "assigned" && conv.pvSource !== "menu" && customerId && !listReplyId) {
+    const orderPv = await getLatestOrderPV(customerId, accessToken);
+    if (orderPv && orderPv !== conv.pv) {
+      conv.pv = orderPv;
+      conv.pvSource = "order";
     }
   }
 
