@@ -181,6 +181,20 @@ async function setDocument(path, obj, accessToken) {
   }
 }
 
+// ── Aggiorna UN solo campo di un documento esistente (via updateMask), senza toccare gli altri campi ──
+async function patchField(path, fieldName, value, accessToken) {
+  const url = FIRESTORE_BASE + "/" + path + "?updateMask.fieldPaths=" + encodeURIComponent(fieldName);
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+    body: JSON.stringify({ fields: toFirestoreFields({ [fieldName]: value }) })
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error("Errore aggiornamento campo " + fieldName + " su " + path, res.status, errText);
+  }
+}
+
 // ── Cerca un cliente su Firestore per un campo esatto (phone oppure bsuid) ──
 async function queryCustomerIdByField(field, value, accessToken) {
   if (!value) return null;
@@ -212,11 +226,11 @@ async function queryCustomerIdByField(field, value, accessToken) {
   return id || null;
 }
 
-// ── Fallback: prima match per telefono, poi per bsuid ──
-async function findCustomerId(phone, waId, accessToken) {
+// ── Fallback: prima match per telefono, poi per bsuid (vero, non il numero di telefono) ──
+async function findCustomerId(phone, bsuid, accessToken) {
   var id = await queryCustomerIdByField("phone", phone, accessToken);
   if (id) return id;
-  id = await queryCustomerIdByField("bsuid", waId, accessToken);
+  id = await queryCustomerIdByField("bsuid", bsuid, accessToken);
   return id;
 }
 
@@ -317,15 +331,26 @@ async function sendPvListMessage(phoneId, token, to) {
 async function saveMessage(msg, contacts, accessToken) {
   const waId = msg.from || "";
   const phone = normPhone(waId);
+  const bsuid = msg.user_id || null; // BSUID stabile (username WhatsApp): resta valido anche se il telefono sparisce
   const contact = (contacts || []).find(function (c) { return c.wa_id === waId; });
   const profileName = (contact && contact.profile && contact.profile.name) || null;
 
   const { type, text, listReplyId } = extractMsgContent(msg);
-  const customerId = await findCustomerId(phone, waId, accessToken);
+  const customerId = await findCustomerId(phone, bsuid, accessToken);
+
+  // Cliente riconosciuto: se la sua scheda non ha ancora un bsuid salvato, lo compiliamo automaticamente
+  // (senza toccare gli altri campi della scheda cliente)
+  if (customerId && bsuid) {
+    const custDoc = await getDocument("customers/" + customerId, accessToken);
+    if (custDoc && !custDoc.bsuid) {
+      await patchField("customers/" + customerId, "bsuid", bsuid, accessToken);
+    }
+  }
 
   const docFields = toFirestoreFields({
     from: phone,
     fromRaw: waId,
+    bsuid: bsuid,
     profileName: profileName,
     type: type,
     text: text,
@@ -348,12 +373,12 @@ async function saveMessage(msg, contacts, accessToken) {
     console.error("Errore salvataggio Firestore wa_messages:", res.status, errText);
   }
 
-  return { phone, waId, profileName, customerId, type, text, listReplyId };
+  return { phone, waId, bsuid, profileName, customerId, type, text, listReplyId };
 }
 
 // ── Aggiorna (o crea) il riepilogo conversazione per questo numero, e gestisce l'assegnazione PV ──
 async function upsertConversation(info, msg, accessToken) {
-  const { phone, waId, profileName, customerId, listReplyId } = info;
+  const { phone, waId, bsuid, profileName, customerId, listReplyId } = info;
   const convPath = "wa_conversations/" + encodeURIComponent(phone);
   const inboundTs = msg.timestamp ? parseInt(msg.timestamp, 10) * 1000 : Date.now();
 
@@ -361,6 +386,7 @@ async function upsertConversation(info, msg, accessToken) {
   if (!conv) {
     conv = {
       phone: phone,
+      bsuid: bsuid || null,
       profileName: profileName || null,
       customerId: customerId || null,
       pv: null,
@@ -413,6 +439,7 @@ async function upsertConversation(info, msg, accessToken) {
   }
 
   conv.customerId = customerId || conv.customerId || null;
+  conv.bsuid = bsuid || conv.bsuid || null;
   conv.profileName = profileName || conv.profileName || null;
   conv.lastMessageText = info.text;
   conv.lastMessageAt = inboundTs;
