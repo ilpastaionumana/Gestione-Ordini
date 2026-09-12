@@ -1,4 +1,4 @@
-// netlify/functions/wa-webhook.js
+// netlify/functions/wa-webhook.js ,
 //
 // Riceve i messaggi WhatsApp in arrivo dai clienti (webhook Meta Cloud API),
 // li salva su Firestore (collection "wa_messages") e mantiene aggiornata
