@@ -1,0 +1,554 @@
+// netlify/functions/wa-webhook.js
+//
+// Riceve i messaggi WhatsApp in arrivo dai clienti (webhook Meta Cloud API),
+// li salva su Firestore (collection "wa_messages") e mantiene aggiornata
+// la collection "wa_conversations" (un documento per numero di telefono,
+// usato dall'app per mostrare l'elenco chat con badge non letti e per
+// gestire l'assegnazione del punto vendita).
+//
+// Se un numero non è ancora riconosciuto in anagrafica (customerId null),
+// il webhook manda automaticamente al cliente un menu a lista con i 4 punti
+// vendita, e ne legge la risposta per assegnare il pv alla conversazione.
+// Il menu viene rimandato al massimo una seconda volta se il cliente non
+// risponde toccando una voce del menu; oltre a questo la conversazione resta
+// "in attesa" e va assegnata manualmente dall'admin nell'app.
+//
+// Nessuna dipendenza npm: usa solo moduli nativi di Node (crypto, fetch globale)
+// per autenticarsi su Firestore tramite REST API con un Service Account.
+//
+// VARIABILI D'AMBIENTE RICHIESTE (da impostare su Netlify):
+//   FB_CLIENT_EMAIL   -> "client_email" dal file JSON del Service Account Firebase
+//   FB_PRIVATE_KEY    -> "private_key" dal file JSON del Service Account Firebase
+//   WA_VERIFY_TOKEN   -> stringa a scelta, deve coincidere con quella inserita su Meta
+
+const crypto = require("crypto");
+
+const PROJECT_ID = "il-pastaio-b8d61";
+const FIRESTORE_BASE = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+const GRAPH_API_VERSION = "v19.0";
+
+// ── Righe del menu a lista mandato ai contatti non ancora assegnati a un PV ──
+const PV_LIST_ROWS = [
+  { id: "pv_numana", title: "Numana" },
+  { id: "pv_osimo", title: "Osimo Stazione" },
+  { id: "pv_sirolo", title: "Sirolo" },
+  { id: "pv_ancona", title: "Ancona" }
+];
+const PV_ID_TO_NAME = { pv_numana: "NUMANA", pv_osimo: "OSIMO STAZIONE", pv_sirolo: "SIROLO", pv_ancona: "ANCONA" };
+
+// ── Alias storici del campo pv, stessa logica di _normPV() in index.html ──
+const PV_ALIAS = { OSIMO: "OSIMO STAZIONE", NUM: "NUMANA", OSI: "OSIMO STAZIONE", SIR: "SIROLO", ANC: "ANCONA" };
+function normPV(s) {
+  if (!s) return null;
+  const u = String(s).trim().replace(/\s+/g, " ").toUpperCase();
+  return PV_ALIAS[u] || u;
+}
+
+// Numero massimo di volte che rimandiamo il menu se il cliente non risponde toccandolo
+const MAX_PV_PROMPTS = 2;
+
+// ── Normalizza numero telefono: stessa logica di normPhone() in index.html ──
+function normPhone(p) {
+  if (!p) return "";
+  p = String(p).replace(/\D/g, "");
+  if (!p) return "";
+  if (p.startsWith("0")) p = "39" + p.slice(1);
+  else if (p.length === 10 && !p.startsWith("39")) p = "39" + p;
+  else if (p.length === 9) p = "39" + p;
+  return p;
+}
+
+// ── Base64url helper per JWT ──
+function base64url(input) {
+  return Buffer.from(input)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+// ── Crea e firma un JWT RS256 per l'autenticazione Service Account (Google OAuth2) ──
+function createServiceAccountJWT(clientEmail, privateKey) {
+  const header = { alg: "RS256", typ: "JWT" };
+  const now = Math.floor(Date.now() / 1000);
+  const claim = {
+    iss: clientEmail,
+    scope: "https://www.googleapis.com/auth/datastore",
+    aud: "https://oauth2.googleapis.com/token",
+    exp: now + 3600,
+    iat: now
+  };
+  const signInput = base64url(JSON.stringify(header)) + "." + base64url(JSON.stringify(claim));
+  const signer = crypto.createSign("RSA-SHA256");
+  signer.update(signInput);
+  signer.end();
+  const signature = signer.sign(privateKey);
+  const encSig = signature
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  return signInput + "." + encSig;
+}
+
+// ── Scambia il JWT per un access token OAuth2 valido per le API Google ──
+async function getAccessToken() {
+  const clientEmail = process.env.FB_CLIENT_EMAIL;
+  const privateKeyRaw = process.env.FB_PRIVATE_KEY || "";
+  // Su Netlify le variabili multilinea vengono spesso salvate con \n letterali: li ripristiniamo
+  const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
+
+  if (!clientEmail || !privateKey) {
+    throw new Error("FB_CLIENT_EMAIL o FB_PRIVATE_KEY mancanti nelle variabili d'ambiente");
+  }
+
+  const jwt = createServiceAccountJWT(clientEmail, privateKey);
+
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body:
+      "grant_type=" +
+      encodeURIComponent("urn:ietf:params:oauth:grant-type:jwt-bearer") +
+      "&assertion=" +
+      jwt
+  });
+  const data = await res.json();
+  if (!data.access_token) {
+    throw new Error("Impossibile ottenere access token: " + JSON.stringify(data));
+  }
+  return data.access_token;
+}
+
+// ── Conversione valori JS -> formato tipizzato Firestore REST ──
+function toFirestoreValue(v) {
+  if (v === null || v === undefined) return { nullValue: null };
+  if (typeof v === "boolean") return { booleanValue: v };
+  if (typeof v === "number") {
+    return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+  }
+  return { stringValue: String(v) };
+}
+function toFirestoreFields(obj) {
+  const fields = {};
+  Object.keys(obj).forEach(function (k) {
+    fields[k] = toFirestoreValue(obj[k]);
+  });
+  return fields;
+}
+
+// ── Conversione valore tipizzato Firestore REST -> valore JS ──
+function fromFirestoreValue(v) {
+  if (!v) return null;
+  if ("stringValue" in v) return v.stringValue;
+  if ("integerValue" in v) return parseInt(v.integerValue, 10);
+  if ("doubleValue" in v) return v.doubleValue;
+  if ("booleanValue" in v) return v.booleanValue;
+  return null; // nullValue o tipo non gestito
+}
+function fromFirestoreFields(fields) {
+  const out = {};
+  Object.keys(fields || {}).forEach(function (k) {
+    out[k] = fromFirestoreValue(fields[k]);
+  });
+  return out;
+}
+
+// ── Legge un singolo documento Firestore per path completo (collection/docId). null se non esiste ──
+async function getDocument(path, accessToken) {
+  const url = FIRESTORE_BASE + "/" + path;
+  const res = await fetch(url, { headers: { Authorization: "Bearer " + accessToken } });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    console.error("Errore lettura Firestore " + path, res.status);
+    return null;
+  }
+  const data = await res.json();
+  return fromFirestoreFields(data.fields);
+}
+
+// ── Scrive (sovrascrivendo per intero) un documento Firestore per path completo ──
+async function setDocument(path, obj, accessToken) {
+  const url = FIRESTORE_BASE + "/" + path;
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+    body: JSON.stringify({ fields: toFirestoreFields(obj) })
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error("Errore scrittura Firestore " + path, res.status, errText);
+  }
+}
+
+// ── Aggiorna UN solo campo di un documento esistente (via updateMask), senza toccare gli altri campi ──
+async function patchField(path, fieldName, value, accessToken) {
+  const url = FIRESTORE_BASE + "/" + path + "?updateMask.fieldPaths=" + encodeURIComponent(fieldName);
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+    body: JSON.stringify({ fields: toFirestoreFields({ [fieldName]: value }) })
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error("Errore aggiornamento campo " + fieldName + " su " + path, res.status, errText);
+  }
+}
+
+// ── Come patchField, ma per più campi in un'unica chiamata (via updateMask multiplo), senza toccare gli altri campi ──
+async function patchFields(path, obj, accessToken) {
+  const fieldNames = Object.keys(obj);
+  const maskParams = fieldNames.map(f => "updateMask.fieldPaths=" + encodeURIComponent(f)).join("&");
+  const url = FIRESTORE_BASE + "/" + path + "?" + maskParams;
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+    body: JSON.stringify({ fields: toFirestoreFields(obj) })
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error("Errore aggiornamento campi " + fieldNames.join(",") + " su " + path, res.status, errText);
+  }
+}
+
+// ── Cerca un cliente su Firestore per un campo esatto (phone oppure bsuid) ──
+async function queryCustomerIdByField(field, value, accessToken) {
+  if (!value) return null;
+  const url = FIRESTORE_BASE + ":runQuery";
+  const body = {
+    structuredQuery: {
+      from: [{ collectionId: "customers" }],
+      where: {
+        fieldFilter: {
+          field: { fieldPath: field },
+          op: "EQUAL",
+          value: { stringValue: value }
+        }
+      },
+      limit: 1
+    }
+  };
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  const match = Array.isArray(data) ? data.find(function (r) { return r.document; }) : null;
+  if (!match) return null;
+  const name = match.document.name || "";
+  const id = name.split("/").pop();
+  return id || null;
+}
+
+// ── Fallback: prima match per telefono, poi per bsuid (vero, non il numero di telefono) ──
+async function findCustomerId(phone, bsuid, accessToken) {
+  var id = await queryCustomerIdByField("phone", phone, accessToken);
+  if (id) return id;
+  id = await queryCustomerIdByField("bsuid", bsuid, accessToken);
+  return id;
+}
+
+// ── Cerca l'ordine più recente di un cliente e restituisce il suo pv (normalizzato), o null ──
+// NB: questa query richiede un indice composito Firestore (customerId + date).
+// La primissima volta, se l'indice non esiste ancora, Firestore risponde con un errore
+// che contiene un link diretto per crearlo: lo trovi nei log della function su Netlify.
+async function getLatestOrderPV(customerId, accessToken) {
+  if (!customerId) return null;
+  const url = FIRESTORE_BASE + ":runQuery";
+  const body = {
+    structuredQuery: {
+      from: [{ collectionId: "orders" }],
+      where: {
+        fieldFilter: {
+          field: { fieldPath: "customerId" },
+          op: "EQUAL",
+          value: { stringValue: customerId }
+        }
+      },
+      orderBy: [{ field: { fieldPath: "date" }, direction: "DESCENDING" }],
+      limit: 1
+    }
+  };
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error("Errore query ultimo ordine cliente (indice Firestore mancante?):", res.status, errText);
+    return null;
+  }
+  const data = await res.json();
+  const match = Array.isArray(data) ? data.find(function (r) { return r.document; }) : null;
+  if (!match) return null;
+  const fields = fromFirestoreFields(match.document.fields);
+  return fields.pv ? normPV(fields.pv) : null;
+}
+
+// ── Legge token+phoneId dell'account WhatsApp da settings/wa_config ──
+async function getWaConfig(accessToken) {
+  const doc = await getDocument("settings/wa_config", accessToken);
+  if (!doc || !doc.token || !doc.phoneId) return null;
+  return { token: doc.token, phoneId: doc.phoneId };
+}
+
+// ── Estrae tipo e testo "leggibile" da un messaggio Meta in arrivo ──
+function extractMsgContent(msg) {
+  const type = msg.type || "unknown";
+  let text = null;
+  let listReplyId = null;
+  if (type === "text" && msg.text) text = msg.text.body;
+  else if (type === "button" && msg.button) text = msg.button.text;
+  else if (type === "interactive" && msg.interactive) {
+    if (msg.interactive.list_reply) {
+      text = msg.interactive.list_reply.title || null;
+      listReplyId = msg.interactive.list_reply.id || null;
+    } else if (msg.interactive.button_reply) {
+      text = msg.interactive.button_reply.title || null;
+    }
+  }
+  return { type, text, listReplyId };
+}
+
+// ── Manda al cliente il menu a lista per scegliere il punto vendita ──
+async function sendPvListMessage(phoneId, token, to) {
+  const payload = {
+    messaging_product: "whatsapp",
+    to: to,
+    type: "interactive",
+    interactive: {
+      type: "list",
+      body: { text: "Ciao! 👋 Per quale punto vendita scrivi? Scegli dal menu qui sotto:" },
+      action: {
+        button: "Scegli negozio",
+        sections: [{ title: "Punti vendita", rows: PV_LIST_ROWS }]
+      }
+    }
+  };
+  try {
+    const res = await fetch(`https://graph.facebook.com/${GRAPH_API_VERSION}/${phoneId}/messages`, {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error("Errore invio menu PV:", res.status, errText);
+    }
+  } catch (e) {
+    console.error("Errore invio menu PV:", e.message);
+  }
+}
+
+// ── Salva un singolo messaggio in arrivo su Firestore (upsert per wamid = idempotente) ──
+// ── Aggiorna lo stato di consegna/lettura (sent/delivered/read/failed) di un messaggio in uscita già salvato.
+// Il doc ID in "wa_messages" per i messaggi in uscita è sempre il wamid (vedi waSendText/waSendTemplate in app.js),
+// quindi lo status che arriva da Meta si aggancia direttamente al documento giusto senza bisogno di query.
+async function updateMessageStatus(status, accessToken) {
+  const wamid = status.id;
+  if (!wamid) return;
+  const patch = {
+    waStatus: status.status || null,
+    waStatusAt: status.timestamp ? parseInt(status.timestamp, 10) : Math.floor(Date.now() / 1000)
+  };
+  if (status.status === "failed" && status.errors && status.errors[0]) {
+    patch.waStatusError = status.errors[0].title || status.errors[0].message || null;
+  }
+  await patchFields("wa_messages/" + wamid, patch, accessToken);
+}
+
+async function saveMessage(msg, contacts, accessToken) {
+  const waId = msg.from || "";
+  const phone = normPhone(waId);
+  const bsuid = msg.user_id || null; // BSUID stabile (username WhatsApp): resta valido anche se il telefono sparisce
+  const contact = (contacts || []).find(function (c) { return c.wa_id === waId; });
+  const profileName = (contact && contact.profile && contact.profile.name) || null;
+
+  const { type, text, listReplyId } = extractMsgContent(msg);
+  const customerId = await findCustomerId(phone, bsuid, accessToken);
+
+  // Cliente riconosciuto: se la sua scheda non ha ancora un bsuid salvato, lo compiliamo automaticamente
+  // (senza toccare gli altri campi della scheda cliente)
+  if (customerId && bsuid) {
+    const custDoc = await getDocument("customers/" + customerId, accessToken);
+    if (custDoc && !custDoc.bsuid) {
+      await patchField("customers/" + customerId, "bsuid", bsuid, accessToken);
+    }
+  }
+
+  const docFields = toFirestoreFields({
+    from: phone,
+    fromRaw: waId,
+    bsuid: bsuid,
+    profileName: profileName,
+    type: type,
+    text: text,
+    timestamp: msg.timestamp ? parseInt(msg.timestamp, 10) : null,
+    receivedAt: new Date().toISOString(),
+    direction: "in",
+    customerId: customerId,
+    pv: null,
+    read: false
+  });
+
+  const url = FIRESTORE_BASE + "/wa_messages/" + encodeURIComponent(msg.id);
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+    body: JSON.stringify({ fields: docFields })
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error("Errore salvataggio Firestore wa_messages:", res.status, errText);
+  }
+
+  return { phone, waId, bsuid, profileName, customerId, type, text, listReplyId };
+}
+
+// ── Aggiorna (o crea) il riepilogo conversazione per questo numero, e gestisce l'assegnazione PV ──
+async function upsertConversation(info, msg, accessToken) {
+  const { phone, waId, bsuid, profileName, customerId, listReplyId } = info;
+  const convPath = "wa_conversations/" + encodeURIComponent(phone);
+  const inboundTs = msg.timestamp ? parseInt(msg.timestamp, 10) * 1000 : Date.now();
+
+  let conv = await getDocument(convPath, accessToken);
+  if (!conv) {
+    conv = {
+      phone: phone,
+      bsuid: bsuid || null,
+      profileName: profileName || null,
+      customerId: customerId || null,
+      pv: null,
+      pvStatus: "pending",
+      pvSource: null, // "order" = dedotto da un ordine, "menu" = scelto dal cliente
+      lastMessageText: null,
+      lastMessageAt: 0,
+      lastInboundAt: 0,
+      unreadCount: 0,
+      pvPromptCount: 0
+    };
+    // Cliente già conosciuto: prova a dedurre il pv dal suo ordine più recente
+    if (customerId) {
+      const orderPv = await getLatestOrderPV(customerId, accessToken);
+      if (orderPv) {
+        conv.pv = orderPv;
+        conv.pvStatus = "assigned";
+        conv.pvSource = "order";
+      }
+    }
+  }
+
+  // Risposta al menu: assegna il pv scelto dal cliente (scelta esplicita, non verrà più ricontrollata)
+  if (conv.pvStatus === "pending" && listReplyId && PV_ID_TO_NAME[listReplyId]) {
+    conv.pv = PV_ID_TO_NAME[listReplyId];
+    conv.pvStatus = "assigned";
+    conv.pvSource = "menu";
+  }
+
+  // Ancora in attesa ma con un cliente noto: ritenta la deduzione (potrebbe aver ordinato nel frattempo)
+  if (conv.pvStatus === "pending" && customerId && !listReplyId) {
+    const orderPv = await getLatestOrderPV(customerId, accessToken);
+    if (orderPv) {
+      conv.pv = orderPv;
+      conv.pvStatus = "assigned";
+      conv.pvSource = "order";
+    }
+  }
+
+  // Pv già assegnato ma dedotto da un ordine (non scelto esplicitamente dal cliente): ricontrolla
+  // ad ogni messaggio, perché il cliente potrebbe aver fatto nel frattempo un ordine per un altro pv.
+  // (conv.pvSource mancante = conversazione creata prima di questa modifica: trattata come "order"
+  // per sicurezza, così si autocorregge automaticamente al primo messaggio successivo)
+  if (conv.pvStatus === "assigned" && conv.pvSource !== "menu" && customerId && !listReplyId) {
+    const orderPv = await getLatestOrderPV(customerId, accessToken);
+    if (orderPv && orderPv !== conv.pv) {
+      conv.pv = orderPv;
+      conv.pvSource = "order";
+    }
+  }
+
+  conv.customerId = customerId || conv.customerId || null;
+  conv.bsuid = bsuid || conv.bsuid || null;
+  conv.profileName = profileName || conv.profileName || null;
+  conv.lastMessageText = info.text;
+  conv.lastMessageAt = inboundTs;
+  conv.lastInboundAt = inboundTs;
+  conv.unreadCount = (conv.unreadCount || 0) + 1;
+
+  // Se ancora senza pv, e non era questo il messaggio di risposta al menu, valuta se ri-mandarlo
+  if (conv.pvStatus === "pending" && !listReplyId && (conv.pvPromptCount || 0) < MAX_PV_PROMPTS) {
+    const cfg = await getWaConfig(accessToken);
+    if (cfg) {
+      await sendPvListMessage(cfg.phoneId, cfg.token, waId);
+      conv.pvPromptCount = (conv.pvPromptCount || 0) + 1;
+    }
+  }
+
+  await setDocument(convPath, conv, accessToken);
+}
+
+// ── Elabora l'intero payload del webhook Meta (può contenere più entry/messaggi) ──
+async function processWebhook(body) {
+  if (body.object !== "whatsapp_business_account") return;
+  const entries = body.entry || [];
+  for (const entry of entries) {
+    const changes = entry.changes || [];
+    for (const change of changes) {
+      const value = change.value || {};
+      const accessToken = await getAccessToken();
+
+      // Status update (sent/delivered/read/failed) su messaggi già inviati da noi
+      const statuses = value.statuses || [];
+      for (const status of statuses) {
+        await updateMessageStatus(status, accessToken);
+      }
+
+      const messages = value.messages || [];
+      if (!messages.length) continue;
+      const contacts = value.contacts || [];
+      for (const msg of messages) {
+        const info = await saveMessage(msg, contacts, accessToken);
+        await upsertConversation(info, msg, accessToken);
+      }
+    }
+  }
+}
+
+exports.handler = async function (event) {
+  // ── Verifica webhook (chiamata GET fatta da Meta in fase di configurazione) ──
+  if (event.httpMethod === "GET") {
+    const params = event.queryStringParameters || {};
+    const mode = params["hub.mode"];
+    const token = params["hub.verify_token"];
+    const challenge = params["hub.challenge"];
+    if (mode === "subscribe" && token === process.env.WA_VERIFY_TOKEN) {
+      return { statusCode: 200, headers: { "Content-Type": "text/plain" }, body: challenge || "" };
+    }
+    return { statusCode: 403, body: "Forbidden" };
+  }
+
+  if (event.httpMethod !== "POST") {
+    return { statusCode: 405, body: "Method Not Allowed" };
+  }
+
+  let body;
+  try {
+    body = JSON.parse(event.body);
+  } catch (e) {
+    // Rispondiamo comunque 200 per non far ritentare Meta all'infinito su payload malformati
+    return { statusCode: 200, body: "ignored" };
+  }
+
+  try {
+    await processWebhook(body);
+  } catch (err) {
+    // Logghiamo l'errore ma rispondiamo comunque 200: se rispondiamo con errore,
+    // Meta ritenta a raffica lo stesso webhook per ore
+    console.error("wa-webhook error:", err);
+  }
+
+  return { statusCode: 200, body: "EVENT_RECEIVED" };
+};
