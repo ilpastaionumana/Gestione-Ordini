@@ -7,14 +7,14 @@
 <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
 <link rel="icon" type="image/png" sizes="48x48" href="favicon-48.png">
 <!-- Apple iOS / iPadOS home screen icon -->
-<link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
+<link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon-v2.png">
 <meta name="apple-mobile-web-app-title" content="Il Pastaio">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <!-- Android / Chrome PWA manifest inline -->
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#C4622D">
 <meta name="msapplication-TileColor" content="#C4622D">
-<meta name="msapplication-TileImage" content="apple-touch-icon.png">
+<meta name="msapplication-TileImage" content="apple-touch-icon-v2.png">
 
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -1007,7 +1007,7 @@
       const swReg = _fcmSwReg || (await navigator.serviceWorker.ready);
       await swReg.showNotification('🍝 Il Pastaio — Test', {
         body: 'Le notifiche funzionano correttamente su questo dispositivo!',
-        icon: '/apple-touch-icon.png',
+        icon: '/apple-touch-icon-v2.png',
         badge: '/favicon-32.png',
         tag: 'test',
         requireInteraction: false
